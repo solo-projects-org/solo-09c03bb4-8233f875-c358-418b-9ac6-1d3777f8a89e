@@ -1,13 +1,16 @@
 """FastAPI web platform for Avro instrument-event format upgrades."""
 from __future__ import annotations
 
+import math
 import os
 import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.encoders import jsonable_encoder
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -15,6 +18,7 @@ from pydantic import BaseModel, Field
 from ..avro_codec import DEFAULT_SCHEMA_V1
 from . import db
 from .analyzer_client import ANALYZER_ORDER, build_clients
+from .qc import QCService, QcError
 from .services import GuardError, SwitchService
 
 DB_PATH = os.environ.get("WEBAPP_DB", "/data/webapp.db")
@@ -23,6 +27,7 @@ WEB_DIR = Path(__file__).resolve().parent.parent.parent / "web"
 RECONCILE_INTERVAL = float(os.environ.get("RECONCILE_INTERVAL", "5"))
 
 service: Optional[SwitchService] = None
+qc_service: Optional[QCService] = None
 _bg_stop = threading.Event()
 
 
@@ -53,18 +58,29 @@ def _bg_reconcile() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global service
+    global service, qc_service
     if service is None:  # tests may inject an in-process SwitchService
         db.init(_db_path())
         clients = build_clients(_analyzer_urls())
         service = SwitchService(_db_path(), clients)
+        qc_service = QCService(_db_path(), clients)
     else:
         db.init(_db_path())
+        if qc_service is None:
+            qc_service = QCService(_db_path(), service.clients)
     # Startup reconciliation: verify every durable pending switch and resume.
     try:
         service.reconcile_all()
     except Exception as exc:
         print(f"[startup] initial reconciliation failed: {exc}", flush=True)
+    # A restart can never leave a half-finished QC scan on display.
+    try:
+        recovered = qc_service.recover_interrupted()
+        if recovered:
+            print(f"[startup] marked {recovered} interrupted QC scan(s) as failed",
+                  flush=True)
+    except Exception as exc:
+        print(f"[startup] QC recovery failed: {exc}", flush=True)
     t = threading.Thread(target=_bg_reconcile, name="reconciler", daemon=True)
     t.start()
     yield
@@ -72,6 +88,26 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Avro 仪器事件格式升级平台", lifespan=lifespan)
+
+
+@app.exception_handler(RequestValidationError)
+async def _validation_handler(request: Request, exc: RequestValidationError):
+    # NaN passes JSON parsing but fails pydantic's ge=0 constraint; surface
+    # every validation failure as a structured 422 instead of a bare 500.
+    # json.dumps itself rejects NaN/Infinity, so sanitise the echoed input.
+    def _sanitize(obj):
+        if isinstance(obj, float) and not math.isfinite(obj):
+            return repr(obj)  # "nan" / "inf" / "-inf" as plain strings
+        if isinstance(obj, dict):
+            return {k: _sanitize(v) for k, v in obj.items()}
+        if isinstance(obj, (list, tuple)):
+            return [_sanitize(v) for v in obj]
+        return obj
+
+    return JSONResponse(
+        status_code=422,
+        content={"ok": False, "error": "请求参数校验失败",
+                 "details": _sanitize(jsonable_encoder(exc.errors()))})
 
 
 # --- request models ---------------------------------------------------------
@@ -115,6 +151,16 @@ class DecodeIn(BaseModel):
     analyzer_id: str
 
 
+class QcLimitsIn(BaseModel):
+    project: str
+    lower_limit: float = Field(..., ge=0)
+    upper_limit: float = Field(..., ge=0)
+
+
+class QcScanIn(BaseModel):
+    project: str
+
+
 # --- helpers ----------------------------------------------------------------
 
 def _guard_response(exc: GuardError, status: int = 409) -> JSONResponse:
@@ -136,7 +182,9 @@ app.mount("/static", StaticFiles(directory=WEB_DIR), name="static")
 
 @app.get("/api/status")
 def get_status():
-    return service.status()
+    payload = service.status()
+    payload["qc"] = qc_service.status()
+    return payload
 
 
 @app.get("/api/default-schema")
@@ -221,6 +269,44 @@ def switch_reader(req: ReaderSwitchIn):
 @app.post("/api/reconcile")
 def reconcile():
     return {"ok": True, "result": service.reconcile_all()}
+
+
+# --- project quality control -------------------------------------------------
+
+@app.get("/api/qc/status")
+def qc_status():
+    return {"ok": True, "qc": qc_service.status()}
+
+
+@app.post("/api/qc/limits")
+def qc_set_limits(req: QcLimitsIn):
+    try:
+        row = qc_service.set_limits(req.project, req.lower_limit, req.upper_limit)
+    except QcError as exc:
+        return JSONResponse(status_code=422,
+                            content={"ok": False, "error": str(exc)})
+    return {"ok": True, "limits": row}
+
+
+@app.post("/api/qc/scan")
+def qc_start_scan(req: QcScanIn):
+    try:
+        view = qc_service.start_scan(req.project)
+    except QcError as exc:
+        # Covers missing limits, an already-running scan and unreachable
+        # analyzers: all are request-level preconditions, never a 500.
+        return JSONResponse(status_code=409,
+                            content={"ok": False, "error": str(exc)})
+    return {"ok": True, "run": view}
+
+
+@app.get("/api/qc/runs/{run_id}")
+def qc_get_run(run_id: str):
+    try:
+        return {"ok": True, "run": qc_service.get_run(run_id)}
+    except QcError as exc:
+        return JSONResponse(status_code=404,
+                            content={"ok": False, "error": str(exc)})
 
 
 # --- simulation -------------------------------------------------------------

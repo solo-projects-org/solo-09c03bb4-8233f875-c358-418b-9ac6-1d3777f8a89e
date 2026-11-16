@@ -110,4 +110,9 @@ td pre { max-height: 140px; margin: 0; }
 .msg-ok  { color: #176c3b; font-size: 13px; margin-top: 8px; }
 .msg-err { color: #a02626; font-size: 13px; margin-top: 8px; white-space: pre-wrap; }
 .card.fault { border-color: #e6c88f; background: #fffdf6; }
+.card.qc { border-color: #9db7e6; background: #f8faff; }
+.badge.stale   { background: #eef0f3; color: #5a6b80; border: 1px solid #b9c4d2; }
+.badge.scanning { background: #fff4e0; color: #9a6200; border: 1px solid #f0c36d; }
+table.qc-events { margin-top: 8px; }
+table.qc-events th { white-space: nowrap; }
 .pill { font-size: 11px; background: #e8eef7; border-radius: 5px; padding: 1px 6px; margin-left: 4px; }

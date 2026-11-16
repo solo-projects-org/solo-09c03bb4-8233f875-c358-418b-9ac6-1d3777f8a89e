@@ -18,6 +18,7 @@ from app.analyzer import db as analyzer_db
 from app.webapp import db as web_db
 from app.webapp import main as web_main
 from app.webapp.analyzer_client import AnalyzerClient, RemoteError
+from app.webapp.qc import QCService, classify_measurement
 
 
 V1 = {
@@ -128,12 +129,12 @@ class PlatformHarness:
         # Webapp
         os.environ["WEBAPP_DB"] = self.web_db_path
         web_db.init(self.web_db_path)
-        self.service = web_main.SwitchService(
-            self.web_db_path,
-            {"analyzer-a": ASGIAnalyzerClient(self.app_a),
-             "analyzer-b": ASGIAnalyzerClient(self.app_b)},
-        )
+        clients = {"analyzer-a": ASGIAnalyzerClient(self.app_a),
+                   "analyzer-b": ASGIAnalyzerClient(self.app_b)}
+        self.service = web_main.SwitchService(self.web_db_path, clients)
+        self.qc = QCService(self.web_db_path, clients)
         web_main.service = self.service
+        web_main.qc_service = self.qc
         self.web = TestClient(web_main.app)
 
 

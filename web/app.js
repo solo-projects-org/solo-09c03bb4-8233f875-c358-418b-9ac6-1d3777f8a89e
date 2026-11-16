@@ -44,6 +44,7 @@ async function refresh() {
   renderEvents(s);
   renderDecodes(s);
   renderHistory(s);
+  if (s.qc) renderQc(s.qc);
 }
 
 function renderStates(s) {
@@ -252,6 +253,114 @@ $("btn-sim").onclick = async () => {
     $("sim-msg").textContent = "故障注入失败：" + e.message;
     $("sim-msg").className = "msg-err";
   }
+};
+
+// ---------------- 项目质控 ----------------
+function qcStatusBadge(run) {
+  if (run.status === "scanning") {
+    return '<span class="badge pending">扫描中 scanning</span>';
+  }
+  if (run.status === "failed") {
+    return '<span class="badge rejected">已失败 failed（未发布）</span>';
+  }
+  if (run.is_current) {
+    return '<span class="badge confirmed">当前有效 published</span>';
+  }
+  return '<span class="badge stale">待重算 stale</span>';
+}
+
+function renderQcLimits(qc) {
+  const tb = document.querySelector("#qc-limits-table tbody");
+  tb.innerHTML = qc.limits.map((l) => `<tr>
+      <td>${esc(l.project)}</td>
+      <td>v${l.version}</td>
+      <td>${esc(l.lower_limit)}</td>
+      <td>${esc(l.upper_limit)}</td>
+      <td>${esc(l.updated_at)}</td>
+    </tr>`).join("") || `<tr><td colspan="5" class="hint">尚未配置任何项目限值</td></tr>`;
+}
+
+function renderQcRuns(qc) {
+  const box = $("qc-runs");
+  if (!qc.runs.length) {
+    box.innerHTML = "<div class='hint'>暂无核查任务</div>";
+    return;
+  }
+  box.innerHTML = qc.runs.map((r) => {
+    const stale = (r.stale_reasons || [])
+      .map((x) => `<div class="err">${esc(x)}</div>`).join("");
+    const err = r.error ? `<div class="err">${esc(r.error)}</div>` : "";
+    let rows = "";
+    if (r.status === "published" && r.events && r.events.length) {
+      rows = `<table class="qc-events">
+        <thead><tr><th>#</th><th>事件号</th><th>结论</th><th>A 测值 (v${esc(r.reader_a_version)})</th>
+        <th>B 测值 (v${esc(r.reader_b_version)})</th><th>原因</th></tr></thead>
+        <tbody>${r.events.map((e) => `<tr>
+          <td>${e.seq + 1}</td>
+          <td>${esc(e.event_id)}</td>
+          <td>${e.verdict === "usable"
+            ? '<span class="badge ok">可用</span>'
+            : '<span class="badge fail">问题</span>'}</td>
+          <td>${e.a_value === null ? "—" : esc(e.a_value)}</td>
+          <td>${e.b_value === null ? "—" : esc(e.b_value)}</td>
+          <td>${(e.reasons || []).map((x) => esc(x)).join("<br/>") || ""}</td>
+        </tr>`).join("")}</tbody></table>`;
+    } else if (r.status === "published" && (!r.events || !r.events.length)) {
+      rows = "<div class='hint'>该项目在核查时没有留存事件（空集合结论）。</div>";
+    }
+    return `<div class="switch-row qc-run">
+      <div class="meta">${esc(r.run_id)} · 项目：${esc(r.project)}
+        · 限值 v${esc(r.limits_version)} [${esc(r.lower_limit)}, ${esc(r.upper_limit)}]
+        · 事件 ${r.event_count} 个（hash ${esc((r.event_set_hash || "").slice(0, 10))}）
+        · A v${esc(r.reader_a_version)} / B v${esc(r.reader_b_version)}
+        · 可用 ${r.usable_count} / 问题 ${r.issue_count}
+        · ${esc(r.updated_at)} ${qcStatusBadge(r)}</div>
+      ${stale}${err}${rows}
+    </div>`;
+  }).join("");
+}
+
+function renderQc(qc) {
+  renderQcLimits(qc);
+  renderQcRuns(qc);
+}
+
+function qcMsg(text, ok) {
+  const el = $("qc-msg");
+  el.className = ok ? "msg-ok inline-msg" : "msg-err inline-msg";
+  el.textContent = text;
+}
+
+$("btn-qc-limits").onclick = async () => {
+  const project = $("qc-project").value.trim();
+  const lower = Number($("qc-lower").value);
+  const upper = Number($("qc-upper").value);
+  if (!project) return qcMsg("项目名不能为空", false);
+  if (!Number.isFinite(lower) || !Number.isFinite(upper) || lower < 0 || upper < 0) {
+    return qcMsg("限值必须是非负有限数值", false);
+  }
+  if (lower > upper) return qcMsg("下限不能大于上限", false);
+  try {
+    const r = await api("/api/qc/limits", {
+      method: "POST",
+      body: { project, lower_limit: lower, upper_limit: upper },
+    });
+    qcMsg(`已保存限值（v${r.limits.version}）`, true);
+  } catch (e) { qcMsg("限值保存失败：" + e.message, false); }
+  await refresh();
+};
+
+$("btn-qc-scan").onclick = async () => {
+  const project = $("qc-project").value.trim();
+  if (!project) return qcMsg("项目名不能为空", false);
+  try {
+    const r = await api("/api/qc/scan", {
+      method: "POST",
+      body: { project },
+    });
+    qcMsg(`核查任务已启动：${r.run.run_id}（扫描中，页面将自动刷新进度）`, true);
+  } catch (e) { qcMsg("核查启动失败：" + e.message, false); }
+  await refresh();
 };
 
 // ---------------- 初始化：填入示例 schema ----------------

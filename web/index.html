@@ -148,6 +148,41 @@
     <span id="sim-msg" class="inline-msg"></span>
     <div class="hint">“丢回执”为一次性开关：仅下一次调用丢失；未确认前状态保持 pending，可重启或点对账核实。</div>
   </section>
+
+  <!-- ================= 项目质控 ================= -->
+  <section class="card qc">
+    <h2>⑦ 项目质控（可信测值交付）</h2>
+    <p class="hint">
+      为项目设置非负测值上下限后发起核查：对该项目全部留存事件，由分析服务 A、B 按各自
+      <b>当前生效读取格式</b>解码原始 Avro 字节。两方测值缺失、非数值、不一致或超限的事件按
+      事件号列出原因，其余列为可用。任一服务解码失败则整单失败、不发布部分结果。
+      核查期间入仓、改限值、切换读取格式均不阻塞；结论绑定完整事件集合、限值版本与两方读取版本，
+      任一变化后旧结论显示「待重算」，扫描中的任务不会标为当前。
+    </p>
+    <div class="grid2">
+      <div>
+        <h3>限值设置（非负，修改即生成新限值版本）</h3>
+        <label>项目 project</label>
+        <input id="qc-project" value="重金属普查"/>
+        <label>下限 lower_limit（&ge; 0）</label>
+        <input id="qc-lower" type="number" value="0" min="0" step="any"/>
+        <label>上限 upper_limit（&ge; 下限）</label>
+        <input id="qc-upper" type="number" value="100" min="0" step="any"/>
+        <button id="btn-qc-limits" class="primary">保存限值</button>
+        <button id="btn-qc-scan">发起该项目核查</button>
+        <div id="qc-msg" class="inline-msg"></div>
+      </div>
+      <div>
+        <h3>已配置限值</h3>
+        <table id="qc-limits-table">
+          <thead><tr><th>项目</th><th>版本</th><th>下限</th><th>上限</th><th>更新时间</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+    <h3>核查任务</h3>
+    <div id="qc-runs"></div>
+  </section>
 </main>
 
 <script src="/static/app.js"></script>

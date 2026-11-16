@@ -73,6 +73,45 @@ CREATE TABLE IF NOT EXISTS sim_config (
     drop_writer_switch  INTEGER NOT NULL DEFAULT 0,
     drop_reader_switch  INTEGER NOT NULL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS qc_limits (
+    project             TEXT PRIMARY KEY,
+    version             INTEGER NOT NULL,
+    lower_limit         REAL NOT NULL,
+    upper_limit         REAL NOT NULL,
+    updated_at          TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS qc_runs (
+    run_id              TEXT PRIMARY KEY,
+    project             TEXT NOT NULL,
+    status              TEXT NOT NULL CHECK (status IN ('scanning', 'published', 'failed')),
+    limits_version      INTEGER,
+    lower_limit         REAL,
+    upper_limit         REAL,
+    event_count         INTEGER NOT NULL DEFAULT 0,
+    event_set_hash      TEXT,
+    reader_a_version    INTEGER,
+    reader_b_version    INTEGER,
+    usable_count        INTEGER NOT NULL DEFAULT 0,
+    issue_count         INTEGER NOT NULL DEFAULT 0,
+    error               TEXT,
+    created_at          TEXT NOT NULL,
+    updated_at          TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS qc_run_events (
+    run_id              TEXT NOT NULL,
+    event_id            TEXT NOT NULL,
+    event_seq           INTEGER NOT NULL,
+    verdict             TEXT NOT NULL CHECK (verdict IN ('usable', 'issue')),
+    reasons_json        TEXT NOT NULL,
+    a_value             REAL,
+    b_value             REAL,
+    a_reader_version    INTEGER,
+    b_reader_version    INTEGER,
+    a_ok                INTEGER NOT NULL,
+    b_ok                INTEGER NOT NULL,
+    PRIMARY KEY (run_id, event_id)
+);
+CREATE INDEX IF NOT EXISTS idx_qc_runs_project ON qc_runs(project);
 """
 
 
@@ -293,3 +332,120 @@ def consume_drop_flag(conn: sqlite3.Connection, flag: str) -> bool:
     if armed:
         conn.execute(f"UPDATE sim_config SET {flag} = 0 WHERE id = 1")
     return armed
+
+
+# ----- project QC limits -----------------------------------------------------
+
+def get_qc_limit(conn: sqlite3.Connection, project: str) -> Optional[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM qc_limits WHERE project = ?", (project,)).fetchone()
+
+
+def list_qc_limits(conn: sqlite3.Connection) -> List[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM qc_limits ORDER BY project").fetchall()
+
+
+def upsert_qc_limit(conn: sqlite3.Connection, *, project: str,
+                    lower_limit: float, upper_limit: float) -> sqlite3.Row:
+    """Insert v1 or bump the version. Every change is a new limits version so
+    previously published conclusions can be told they are stale."""
+    row = get_qc_limit(conn, project)
+    version = 1 if row is None else row["version"] + 1
+    conn.execute(
+        "INSERT INTO qc_limits(project, version, lower_limit, upper_limit, updated_at) "
+        "VALUES (?, ?, ?, ?, ?) ON CONFLICT(project) DO UPDATE SET "
+        "version=excluded.version, lower_limit=excluded.lower_limit, "
+        "upper_limit=excluded.upper_limit, updated_at=excluded.updated_at",
+        (project, version, float(lower_limit), float(upper_limit), _now()),
+    )
+    return get_qc_limit(conn, project)
+
+
+# ----- QC runs ---------------------------------------------------------------
+
+def insert_qc_run(conn: sqlite3.Connection, *, run_id: str, project: str,
+                  limits_version: int, lower_limit: float, upper_limit: float,
+                  event_count: int, event_set_hash: str,
+                  reader_a_version: int, reader_b_version: int) -> None:
+    conn.execute(
+        "INSERT INTO qc_runs(run_id, project, status, limits_version, lower_limit, "
+        "upper_limit, event_count, event_set_hash, reader_a_version, reader_b_version, "
+        "usable_count, issue_count, error, created_at, updated_at) "
+        "VALUES (?, ?, 'scanning', ?, ?, ?, ?, ?, ?, ?, 0, 0, NULL, ?, ?)",
+        (run_id, project, limits_version, float(lower_limit), float(upper_limit),
+         event_count, event_set_hash, reader_a_version, reader_b_version,
+         _now(), _now()),
+    )
+
+
+def update_qc_run(conn: sqlite3.Connection, run_id: str, *, status: str,
+                  usable_count: Optional[int] = None,
+                  issue_count: Optional[int] = None,
+                  error: Optional[str] = None) -> None:
+    sets = ["status = ?", "updated_at = ?"]
+    params: List[Any] = [status, _now()]
+    if usable_count is not None:
+        sets.append("usable_count = ?")
+        params.append(usable_count)
+    if issue_count is not None:
+        sets.append("issue_count = ?")
+        params.append(issue_count)
+    if error is not None:
+        sets.append("error = ?")
+        params.append(error)
+    params.append(run_id)
+    conn.execute(f"UPDATE qc_runs SET {', '.join(sets)} WHERE run_id = ?", params)
+
+
+def get_qc_run(conn: sqlite3.Connection, run_id: str) -> Optional[sqlite3.Row]:
+    return conn.execute("SELECT * FROM qc_runs WHERE run_id = ?",
+                        (run_id,)).fetchone()
+
+
+def scanning_qc_runs(conn: sqlite3.Connection) -> List[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM qc_runs WHERE status = 'scanning' ORDER BY rowid"
+    ).fetchall()
+
+
+def latest_qc_runs(conn: sqlite3.Connection, limit: int = 20) -> List[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM qc_runs ORDER BY rowid DESC LIMIT ?", (limit,)).fetchall()
+
+
+def insert_qc_run_event(conn: sqlite3.Connection, *, run_id: str, event_id: str,
+                        event_seq: int, verdict: str, reasons: List[str],
+                        a_value: Optional[float], b_value: Optional[float],
+                        a_reader_version: Optional[int],
+                        b_reader_version: Optional[int],
+                        a_ok: bool, b_ok: bool) -> None:
+    conn.execute(
+        "INSERT INTO qc_run_events(run_id, event_id, event_seq, verdict, reasons_json, "
+        "a_value, b_value, a_reader_version, b_reader_version, a_ok, b_ok) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (run_id, event_id, event_seq, verdict,
+         json.dumps(reasons, ensure_ascii=False), a_value, b_value,
+         a_reader_version, b_reader_version, int(a_ok), int(b_ok)),
+    )
+
+
+def qc_run_events(conn: sqlite3.Connection, run_id: str) -> List[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM qc_run_events WHERE run_id = ? ORDER BY event_seq",
+        (run_id,)).fetchall()
+
+
+def project_event_ids(conn: sqlite3.Connection, project: str) -> List[str]:
+    """Full retained event set for one project, identified by the ``project``
+    field of the ingested Avro payload (authoritative record at ingest time)."""
+    rows = conn.execute("SELECT id, payload_json FROM events").fetchall()
+    ids = []
+    for row in rows:
+        try:
+            payload = json.loads(row["payload_json"])
+        except (TypeError, ValueError):
+            continue
+        if isinstance(payload, dict) and payload.get("project") == project:
+            ids.append(row["id"])
+    return sorted(ids)
